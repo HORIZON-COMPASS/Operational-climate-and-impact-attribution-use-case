@@ -1,0 +1,1539 @@
+diff --git a/attrici/commands/detrend.py b/attrici/commands/detrend.py
+index a180f8cd63b940aacd9ddf6b1909ac2407de4c5b..5e3b3257645083912235ab3c32afee88a465e67b 100644
+--- a/attrici/commands/detrend.py
++++ b/attrici/commands/detrend.py
+@@ -104,7 +104,8 @@ def run(args):
+ 
+     config = Config(**config_dict)
+ 
+-    if args.modes is None and args.window_size is None:
++    window_size = getattr(args, "window_size", None)
++    if args.modes is None and window_size is None:
+         config.modes = MODES_DEFAULT
+ 
+     if args.print_config:
+@@ -225,18 +226,20 @@ def add_parser(subparsers):
+ 
+     # run parameters
+     group = parser.add_argument_group(title="Run parameters")
++    has_window_size = "window_size" in Config.__dataclass_fields__
+     group.add_argument(
+         "--modes",
+         type=int,
+         help=f"Number of modes for fourier series of model (defaults to {MODES_DEFAULT}"
+         " if not set)",
+     )
+-    group.add_argument(
+-        "--window-size",
+-        type=int,
+-        default=Config.__dataclass_fields__["window_size"].default,
+-        help="Size of the window around each day of the year. Must be an odd number.",
+-    )
++    if has_window_size:
++        group.add_argument(
++            "--window-size",
++            type=int,
++            default=Config.__dataclass_fields__["window_size"].default,
++            help="Size of the window around each day of the year. Must be an odd number.",
++        )
+     group.add_argument(
+         "--bootstrap-sample-count",
+         type=int,
+diff --git a/attrici/detrend.py b/attrici/detrend.py
+old mode 100644
+new mode 100755
+index 9f5fb283443eeac2d8da1e52310d6ed4ecb86389..8e48abd58e85ca8bd91dd6991ca5325a3afb9c93
+--- a/attrici/detrend.py
++++ b/attrici/detrend.py
+@@ -1,33 +1,4 @@
+-"""
+-The `detrend` module is the main one in ATTRICI. It provides the functionality for
+-detrending climatological data using statistical models.
+-
+-Usage:
+-The `detrend` function needs to be called with an instance of the configuration
+-class `Config` to perform detrending on the specified dataset.
+-
+-Example:
+-```python
+-from datetime import date
+-from pathlib import Path
+-from attrici.detrend import Config, detrend
+-
+-config = Config(
+-    gmt_file=Path("./tests/data/20CRv3-ERA5_germany_ssa_gmt.nc"),
+-    input_file=Path("./tests/data/20CRv3-ERA5_germany_obs.nc"),
+-    variable="tas",
+-    output_dir=Path("./example-output"),
+-    start_date=date(2000, 1, 1),
+-    stop_date=date(2020, 12, 31),
+-    solver="pymc5"
+-)
+-detrend(config)
+-```
+-
+-For the implementations of the used solvers, see `attrici.estimation`.
+-
+-For command line usage, see `attrici.commands.detrend`.
+-"""
++"""Detrend."""
+ 
+ from dataclasses import dataclass
+ from datetime import date
+@@ -43,9 +14,29 @@ from attrici.util import get_data_provenance_metadata, timeit
+ from attrici.variables import create_variable
+ 
+ 
++def _prime_arviz_daily_warning_stamp():
++    """Pre-create ArviZ daily warning stamp to avoid parallel write race."""
++    try:
++        from platformdirs import user_cache_dir
++
++        warning_dir = Path(user_cache_dir("arviz", "arviz"))
++    except Exception:
++        warning_dir = Path.home() / "Library" / "Caches" / "arviz"
++
++    try:
++        warning_dir.mkdir(parents=True, exist_ok=True)
++        stamp_file = warning_dir / "daily_warning"
++        today = date.today().isoformat()
++        if stamp_file.exists() and stamp_file.read_text().strip() == today:
++            return
++        stamp_file.write_text(today)
++    except Exception as exc:
++        logger.debug("Could not pre-seed ArviZ warning stamp: {}", exc)
++
++
+ @dataclass
+ class Config:
+-    """Object to hold full configuration for a detrending run."""
++    """Configuration object for detrending run."""
+ 
+     gmt_file: Path
+     """Path to (SSA-smoothed) Global Mean Temperature file"""
+@@ -63,10 +54,8 @@ class Config:
+     """Optional path to file with trace from previous fit"""
+     cells: list[tuple[float, float]] | None = None
+     """Optional list of lat,lon tuples to process, otherwise all cells are processed"""
+-    modes: int | None = None
++    modes: int = 4
+     """Number of modes for fourier series of model"""
+-    window_size: int | None = None
+-    """Size of the window around each day of the year"""
+     bootstrap_sample_count: int = 0
+     """Number of bootstrap samples"""
+     overwrite: bool = False
+@@ -117,8 +106,7 @@ class Config:
+ 
+ 
+ def get_task_indices(indices_len, task_id, task_count):
+-    """
+-    Get the indices of the grid cells that this task should work on.
++    """Get the indices of the grid cells that this task should work on.
+ 
+     Parameters
+     ----------
+@@ -170,37 +158,7 @@ def get_task_indices(indices_len, task_id, task_count):
+ 
+ 
+ def save_compressed_netcdf(ds, filename, chunks=None, encoding=None):
+-    """
+-    Save an xarray Dataset to a compressed NetCDF file.
+-
+-    Parameters
+-    ----------
+-    ds : xarray.Dataset
+-        The dataset to be saved.
+-    filename : str or Path
+-        The filename or path where the NetCDF file will be saved.
+-    chunks : dict, optional
+-        Dictionary specifying the chunk sizes for each dimension.
+-        If `None`, no chunking is applied.
+-    encoding : dict, optional
+-        Dictionary specifying the encoding options for each variable.
+-        If `None`, default encoding is used.
+-    """
+-
+-    def _get_full_encoding(varname):
+-        """
+-        Get the full encoding for a variable.
+-
+-        Parameters
+-        ----------
+-        varname : str
+-            The name of the variable
+-
+-        Returns
+-        -------
+-        dict
+-            The full encoding for the variable
+-        """
++    def get_full_encoding(varname):
+         enc = encoding.get(varname, {})
+         enc["zlib"] = True
+         chunks = ds[varname].chunks
+@@ -212,27 +170,13 @@ def save_compressed_netcdf(ds, filename, chunks=None, encoding=None):
+         encoding = {}
+     if chunks is not None:
+         ds = ds.chunk(chunks)
+-    ds.reset_coords(drop=True).to_netcdf(
++    ds.to_netcdf(
+         filename,
+-        encoding={varname: _get_full_encoding(varname) for varname in ds.data_vars},
++        encoding={varname: get_full_encoding(varname) for varname in ds.data_vars},
+     )
+ 
+ 
+ def write_trace(config, trace, lat, lon):
+-    """
+-    Write the trace data, i.e. the result from fitting to the data, to a NetCDF file.
+-
+-    Parameters
+-    ----------
+-    config : Config
+-        Configuration object
+-    trace : dict
+-        Trace data dictionary
+-    lat : float
+-        Latitude of the cell
+-    lon : float
+-        Longitude of the cell
+-    """
+     trace_filename = (
+         Path(config.output_dir)
+         / "trace"
+@@ -258,25 +202,6 @@ def write_trace(config, trace, lat, lon):
+ def fit_and_detrend_cell(
+     config, data, predictor, subset_times, model_class, trace=None
+ ):
+-    """
+-    Fit the model to the data and perform quantile mapping for a single grid cell.
+-
+-    Parameters
+-    ----------
+-    config : Config
+-        Configuration object
+-    data : xarray.DataArray
+-        The time series for the grid cell (including time, lat, lon dimensions)
+-    predictor : xarray.DataArray
+-        The predictor time series (e.g. global mean temperature; including time
+-        dimension)
+-    subset_times : xarray.DataArray
+-        The subset of time points to use
+-    model_class : class
+-        The class of the model to use (e.g. `attrici.estimation.ModelPymc5`)
+-    trace : dict, optional
+-        The trace data dictionary (if fitting was already done)
+-    """
+     lat = data.lat.item()
+     lon = data.lon.item()
+ 
+@@ -312,22 +237,20 @@ def fit_and_detrend_cell(
+ 
+     variable = create_variable(config.variable, data)
+ 
+-    if not variable.y_scaled.notnull().any().item():
+-        logger.warning("No valid data for lat,lon {:g},{:g} - skipping", lat, lon)
+-        return
+-
+     if trace is not None:
+         variable.scaling = {
+             k[len("scaling_") :]: v
+             for k, v in trace.items()
+             if k.startswith("scaling_")
+         }
++        variable.y_scaled = variable.y_scaled_from_scaling(data, variable.scaling)
++
++    if not variable.y_scaled.notnull().any().item():
++        logger.warning("No valid data for lat,lon {:g},{:g} - skipping", lat, lon)
++        return
+ 
+     statistical_model = variable.create_model(
+-        model_class,
+-        predictor.sel(time=subset_times),
+-        modes=config.modes,
+-        window_size=config.window_size,
++        model_class, predictor.sel(time=subset_times), config.modes
+     )
+ 
+     if trace is None:
+@@ -338,7 +261,6 @@ def fit_and_detrend_cell(
+             {
+                 "data": data,
+                 "modes": config.modes,
+-                "window_size": config.window_size,
+                 "predictor": predictor,
+                 "seed": config.seed,
+                 "solver": config.solver,
+@@ -370,16 +292,6 @@ def fit_and_detrend_cell(
+     )
+ 
+     def log_invalid_count(indices, name):
+-        """
+-        Log the number of invalid values from quantile mapping.
+-
+-        Parameters
+-        ----------
+-        indices : xarray.DataArray or numpy.ndarray
+-            Boolean array indicating the positions of invalid values.
+-        name : str
+-            Name of the type of invalid values (e.g., "NaN", "Inf").
+-        """
+         count = indices.sum().item()
+         if count > 0:
+             logger.info(
+@@ -418,21 +330,6 @@ def fit_and_detrend_cell(
+     logger.info("Writing output")
+ 
+     def array_on_cell(d, **kwargs):
+-        """
+-        Create a DataArray with the given data on the cell dimensions.
+-
+-        Parameters
+-        ----------
+-        d : xarray.DataArray or numpy.ndarray or list[float]
+-            The data to put on the cell
+-        kwargs : dict, optional
+-            Additional arguments passed on to `xr.DataArray`
+-
+-        Returns
+-        -------
+-        xarray.DataArray
+-            The data array with the data on the cell
+-        """
+         if isinstance(d, xr.DataArray):
+             d = d.expand_dims(dim=("lat", "lon"), axis=(1, 2))
+         else:
+@@ -487,8 +384,6 @@ def fit_and_detrend_cell(
+ 
+         logger.info("Starting block bootstrap")
+ 
+-        # create blocks of indices of data points for each year, i.e. a list of lists of
+-        # indices, each list containing the indices of the data points for one year
+         blocks = [
+             block_indices
+             for year, block_indices in sorted(
+@@ -498,25 +393,9 @@ def fit_and_detrend_cell(
+         ]
+ 
+         def get_random_block_indices(target_length):
+-            """
+-            Get data point indices from a random block while adjusting for target
+-            block length.
+-
+-            Parameters
+-            ----------
+-            target_length : int
+-                The target length of the block
+-
+-            Returns
+-            -------
+-            np.ndarray
+-                The indices of the data points from the block
+-            """
+             block = np.random.randint(0, len(blocks))
+             block_indices = blocks[block]
+             if len(block_indices) < target_length:
+-                # due to different lengths of years, we might need to take some indices
+-                # from the neighbouring blocks
+                 missing = target_length - len(block_indices)
+                 if block >= len(blocks) - 1:
+                     # last block -> take some indices from the block before
+@@ -524,7 +403,6 @@ def fit_and_detrend_cell(
+                         (blocks[block - 1][-missing:], block_indices)
+                     )
+                 else:
+-                    # otherwise take some indices from the next block
+                     block_indices = np.concatenate(
+                         (block_indices, blocks[block + 1][:missing])
+                     )
+@@ -535,33 +413,18 @@ def fit_and_detrend_cell(
+         bootstrapped_expected_values = []
+         bootstrap_replaced = np.zeros_like(original_y_scaled)
+         for _ in tqdm(range(config.bootstrap_sample_count)):
+-            # we here generate bootstrapped data by reshuffling the quantiles of the
+-            # original data in blocks of one year each
+             new_quantiles = np.concatenate(
+                 [
+                     original_quantiles[get_random_block_indices(len(block_indices))]
+                     for block_indices in blocks
+                 ]
+             )
+-            # then we derive new data time series from the bootstrapped quantiles
+-            # by inverting the CDF as for each original time step, i.e. deriving
+-            # sampling from the original distribution according to the shuffled
+-            # quantiles
+             variable.y_scaled.values = distribution_ref.invcdf(new_quantiles)
+-
+-            # some derived values might be out of bounds or NaN/Inf, so we replace them
+-            # with the original values (and count how often this happens)
+             invalid_indices = np.isnan(variable.y_scaled) | np.isinf(variable.y_scaled)
+             bootstrap_replaced[invalid_indices] += 1
+             variable.y_scaled[invalid_indices] = original_y_scaled[invalid_indices]
+-
+-            # now we fit the model to the bootstrapped data and derive the expected
+-            # values from the fitted distributions
+             statistical_model = variable.create_model(
+-                model_class,
+-                predictor,
+-                modes=config.modes,
+-                window_size=config.window_size,
++                model_class, predictor, config.modes
+             )
+             new_trace = statistical_model.fit()
+             new_distribution = statistical_model.estimate_distribution(
+@@ -571,26 +434,18 @@ def fit_and_detrend_cell(
+                 variable.rescale(new_distribution.expectation())
+             )
+ 
+-        # quantiles to calculate for the bootstrapped expected values
+         quantiles = [0, 0.01, 0.025, 0.05, 0.25, 0.5, 0.75, 0.95, 0.975, 0.99, 1]
+         bootstrap = xr.Dataset(
+             {
+-                # expected values from the distribution fit to the original data
+                 "expected_values": array_on_cell(
+                     variable.rescale(distribution_ref.expectation()), attrs=data.attrs
+                 ),
+-                # standard deviation of the expected values from the distribution fit to
+-                # the bootstrapped data
+                 "bootstrap_std": array_on_cell(
+                     np.std(bootstrapped_expected_values, axis=0), attrs=data.attrs
+                 ),
+-                # mean of the expected values from the distribution fit to the
+-                # bootstrapped data
+                 "bootstrap_mean": array_on_cell(
+                     np.mean(bootstrapped_expected_values, axis=0), attrs=data.attrs
+                 ),
+-                # quantiles of the expected values from the distribution fit to the
+-                # bootstrapped data
+                 "bootstrap_quantiles": xr.DataArray(
+                     np.asarray(
+                         [
+@@ -607,8 +462,6 @@ def fit_and_detrend_cell(
+                     dims=("quantile", "time", "lat", "lon"),
+                     attrs=data.attrs,
+                 ),
+-                # number of times a value was replaced in the bootstrapping process
+-                # (i.e. the number of times the value was NaN or Inf)
+                 "bootstrap_replaced": array_on_cell(bootstrap_replaced),
+             }
+         )
+@@ -632,9 +485,7 @@ def fit_and_detrend_cell(
+ 
+ @timeit
+ def detrend(config: Config):
+-    """
+-    Run the detrending process, i.e. load the data, fit the model, perform quantile
+-    mapping, and save the results.
++    """Run detrending.
+ 
+     Parameters
+     ----------
+@@ -643,11 +494,6 @@ def detrend(config: Config):
+     """
+     logger.info("Detrending with config:\n{}", config.to_toml())
+ 
+-    if (config.modes is None) == (config.window_size is None):
+-        raise ValueError("Exactly one of `modes` and `window_size` must be set")
+-    if config.window_size is not None and config.window_size % 2 == 0:
+-        raise ValueError("Window size must be an odd number")
+-
+     gmt = xr.open_dataset(config.gmt_file)[config.gmt_variable]
+ 
+     # check dimensions and for valid values
+@@ -669,6 +515,9 @@ def detrend(config: Config):
+     if set(obs_data.dims) != {"lat", "lon", "time"}:
+         raise ValueError("Input data must have dimensions lat, lon, time")
+ 
++    obs_lat = obs_data["lat"].values.copy()
++    obs_lon = obs_data["lon"].values.copy()
++
+     obs_data = obs_data.stack(latlon=("lat", "lon"))
+ 
+     if config.cells:
+@@ -684,27 +533,36 @@ def detrend(config: Config):
+         mask = mask.where(mask == 1).dropna("latlon")["latlon"].values
+         obs_data = obs_data.sel(latlon=mask)
+ 
++    gmt_min = gmt.min()
++    gmt_max = gmt.max()
++    gmt_range = gmt_max - gmt_min
++    if np.isclose(gmt_range.item(), 0.0):
++        raise ValueError("GMT data has zero range and cannot be scaled")
++    gmt_scaled_full = (gmt - gmt_min) / gmt_range
++
+     if config.full_extrapolation:
+-        # `gmt.time` is a subset of `obs_data.time` (e.g. every 10th day)
+-        # hence, interpolate these values to the full time series
+-        # the last few days are extrapolated
+-        gmt_on_obs_times = gmt.interp(
++        # Interpolate already-scaled GMT to observation timestamps.
++        # This keeps predictor scaling invariant to input window length.
++        gmt_scaled = gmt_scaled_full.interp(
+             time=obs_data.time, kwargs={"fill_value": "extrapolate"}
+         )
+-        gmt_scaled = (gmt_on_obs_times - gmt_on_obs_times.min()) / (
+-            gmt_on_obs_times.max() - gmt_on_obs_times.min()
+-        )
+     else:
+-        t_scaled = (obs_data.time - obs_data.time.min()) / (
+-            obs_data.time.max() - obs_data.time.min()
+-        )
+-        gmt_on_obs_times = np.interp(t_scaled, np.linspace(0, 1, len(gmt)), gmt)
+-        gmt_scaled_values = (gmt_on_obs_times - gmt_on_obs_times.min()) / (
+-            gmt_on_obs_times.max() - gmt_on_obs_times.min()
+-        )
+-        gmt_scaled = xr.DataArray(
+-            gmt_scaled_values, coords={"time": obs_data.time}, dims=("time",)
+-        )
++        if len(obs_data.time) < 2:
++            gmt_scaled = gmt_scaled_full.interp(
++                time=obs_data.time, kwargs={"fill_value": "extrapolate"}
++            )
++        else:
++            t_scaled = (obs_data.time - obs_data.time.min()) / (
++                obs_data.time.max() - obs_data.time.min()
++            )
++            gmt_scaled_values = np.interp(
++                t_scaled,
++                np.linspace(0, 1, len(gmt_scaled_full)),
++                gmt_scaled_full.values,
++            )
++            gmt_scaled = xr.DataArray(
++                gmt_scaled_values, coords={"time": obs_data.time}, dims=("time",)
++            )
+ 
+     startdate = config.start_date
+     if startdate is None:
+@@ -721,7 +579,21 @@ def detrend(config: Config):
+         (obs_data.time >= startdate) & (obs_data.time <= stopdate)
+     ]
+ 
++    total_cells = len(obs_data.latlon)
++    valid_cells_mask = obs_data.sel(time=subset_times).notnull().any("time")
++    obs_data = obs_data.sel(latlon=valid_cells_mask)
++    skipped_cells = total_cells - len(obs_data.latlon)
++    if skipped_cells > 0:
++        logger.info(
++            "Skipping {} grid cells with no valid observations in selected period",
++            skipped_cells,
++        )
++    if len(obs_data.latlon) == 0:
++        logger.warning("No valid grid cells left after filtering - nothing to process")
++        return
++
+     if config.solver == "pymc5":
++        _prime_arviz_daily_warning_stamp()
+         from attrici.estimation.model_pymc5 import ModelPymc5, initialize
+ 
+         initialize(config.compile_timeout, use_tmp_compiledir=config.task_count > 1)
+@@ -731,6 +603,7 @@ def detrend(config: Config):
+ 
+         model_class = ModelScipy
+     elif config.solver == "pymc3":
++        _prime_arviz_daily_warning_stamp()
+         from attrici.estimation.model_pymc3 import ModelPymc3, initialize
+ 
+         initialize(config.compile_timeout, use_tmp_compiledir=config.task_count > 1)
+@@ -739,11 +612,24 @@ def detrend(config: Config):
+         raise ValueError(f"Unknown solver {config.solver}")
+ 
+     if config.trace_file:
+-        trace = (
+-            xr.open_dataset(config.trace_file)
+-            .stack(latlon=("lat", "lon"))
+-            .sel(latlon=obs_data.latlon)
+-        )
++        trace_ds = xr.open_dataset(config.trace_file)
++        trace_stacked = trace_ds.stack(latlon=("lat", "lon"))
++        try:
++            trace = trace_stacked.sel(latlon=obs_data.latlon)
++        except KeyError:
++            logger.warning(
++                "Trace and input coordinates do not match exactly. "
++                "Trying nearest-neighbour coordinate matching with tolerance."
++            )
++            trace_aligned = trace_ds.reindex(
++                lat=obs_lat,
++                lon=obs_lon,
++                method="nearest",
++                tolerance=1e-4,
++            )
++            trace = trace_aligned.stack(latlon=("lat", "lon")).sel(
++                latlon=obs_data.latlon
++            )
+         if config.write_trace:
+             logger.warning("Ignoring --write-trace as trace file is provided")
+             config.write_trace = False
+diff --git a/attrici/estimation/model.py b/attrici/estimation/model.py
+index 6d30556d6875e489fcc7c415f3e62b1a197583c0..9ed65ce88a4b36d5ae8bf1f7f101182fc0286f03 100644
+--- a/attrici/estimation/model.py
++++ b/attrici/estimation/model.py
+@@ -46,6 +46,16 @@ class AttriciGLM:
+ 
+         link: Callable
+         dependent: bool
++        modes: int | None = None
++        window_size: int | None = None
++
++    @staticmethod
++    def PredictorDependentParam(link: Callable, modes=None):
++        return AttriciGLM.Parameter(link=link, dependent=True, modes=modes)
++
++    @staticmethod
++    def PredictorIndependentParam(link: Callable, modes=None):
++        return AttriciGLM.Parameter(link=link, dependent=False, modes=modes)
+ 
+ 
+ class Model:
+diff --git a/attrici/estimation/model_pymc5.py b/attrici/estimation/model_pymc5.py
+index dac0f12be084de22ba0322bcc4d5c7528c3c8554..3ac0fd52ae7e8a4c1b01671c31e3341530138984 100644
+--- a/attrici/estimation/model_pymc5.py
++++ b/attrici/estimation/model_pymc5.py
+@@ -78,6 +78,10 @@ def setup_parameter_model(name, parameter, modes=None, window_size=None):
+     AttriciGLMPymc5.PredictorIndependentParamRollingWindow
+         The corresponding model object for the given parameter.
+     """
++    if modes is None and window_size is None:
++        modes = getattr(parameter, "modes", None)
++        window_size = getattr(parameter, "window_size", None)
++
+     if modes is not None:
+         if parameter.dependent:
+             return AttriciGLMPymc5.PredictorDependentParam(name, parameter.link, modes)
+diff --git a/attrici/variables.py b/attrici/variables.py
+old mode 100644
+new mode 100755
+index e609cc6d2df36efd35116b0306ec338f029b953b..fd0e8ca327407f6bcd32c220c93fe6e2c1fd4678
+--- a/attrici/variables.py
++++ b/attrici/variables.py
+@@ -1,12 +1,3 @@
+-"""
+-Climate variables.
+-
+-This module contains classes for different climate variables used in the fitting and
+-detrending process. The variables are derived from the `Variable` base class.
+-
+-See also Table 1 in [Mengel et al. (2021)](https://doi.org/10.5194/gmd-14-5269-2021).
+-"""
+-
+ import numpy as np
+ from loguru import logger
+ from scipy import stats
+@@ -16,20 +7,6 @@ from attrici.estimation.model import AttriciGLM
+ 
+ 
+ def check_bounds(data, lower=None, upper=None):
+-    """
+-    Check if the elements in the data array are within the specified bounds.
+-
+-    Parameters
+-    ----------
+-    data : xarray.DataArray
+-        Data to be checked.
+-    lower : float or int, optional
+-        Lower bound. If provided, raises a `ValueError` if any element in data is
+-        smaller.
+-    upper : float or int, optional
+-        Upper bound. If provided, raises a `ValueError` if any element in data is
+-        larger.
+-    """
+     if lower is not None and data.min() < lower:
+         raise ValueError(data.min(), "is smaller than lower bound", lower, ".")
+ 
+@@ -38,24 +15,6 @@ def check_bounds(data, lower=None, upper=None):
+ 
+ 
+ def mask_thresholded(data, lower_threshold=None, upper_threshold=None):
+-    """
+-    Mask elements in the data that are outside the specified thresholds.
+-
+-    Parameters
+-    ----------
+-    data : xarray.DataArray
+-        Data to be masked.
+-    lower_threshold : float or int, optional
+-        Elements in data that are less than or equal to the lower threshold will
+-         be masked as NaN.
+-    upper_threshold : float or int, optional
+-        Elements in data that are greater than or equal to the upper threshold will
+-        be masked as NaN.
+-
+-    Notes
+-    -----
+-    The function logs the number of elements being masked for each threshold.
+-    """
+     if lower_threshold is not None:
+         logger.info(
+             "Mask {} values below lower bound.", (data <= lower_threshold).sum().item()
+@@ -69,42 +28,11 @@ def mask_thresholded(data, lower_threshold=None, upper_threshold=None):
+ 
+ 
+ def refill_and_rescale(scaled_data, scaling):
+-    """
+-    Rescale the data according to the given scaling information.
+-
+-    Parameters
+-    ----------
+-    scaled_data : xarray.DataArray
+-        Data to be rescaled.
+-    scaling : dict
+-        Dictionary containing the scaling information - must contain the key "scale".
+-
+-    Returns
+-    -------
+-    xarray.DataArray
+-        The rescaled data.
+-    """
+-    # refilling of values that have been masked before is done by the calling function
+-    # later (see `attrici.detrend`)
++    # TODO implement refilling of values that have been masked before
+     return scaled_data * scaling["scale"]
+ 
+ 
+ def scale_to_unity(data):
+-    """
+-    Scale data linearly to unity range (map min to 0, max to 1).
+-
+-    Parameters
+-    ----------
+-    data : xarray.DataArray
+-        Data to be scaled.
+-
+-    Returns
+-    -------
+-    xarray.DataArray
+-        The scaled data.
+-    dict
+-        Dictionary containing the scaling information - keys are "datamin" and "scale".
+-    """
+     datamin = data.min()
+     scale = data.max() - datamin
+     scaled_data = (data - datamin) / scale
+@@ -112,36 +40,11 @@ def scale_to_unity(data):
+ 
+ 
+ def rescale_from_unity(scaled_data, scaling):
+-    """
+-    Rescale data from unity range to original range.
+-
+-    Parameters
+-    ----------
+-    scaled_data : xarray.DataArray
+-        Data to be rescaled.
+-    scaling : dict
+-        Dictionary containing the scaling information - must contain the keys "datamin"
+-        and "scale".
+-
+-    Returns
+-    -------
+-    xarray.DataArray
+-        The rescaled data.
+-    """
++    """Use a given datamin and scale to rescale to original."""
+     return scaled_data * scaling["scale"] + scaling["datamin"]
+ 
+ 
+ def check_units(data, units):
+-    """
+-    Check if the units of the data are as expected.
+-
+-    Parameters
+-    ----------
+-    data : xarray.DataArray
+-        Data to be checked.
+-    units : str or set
+-        The expected units (or a set of valid units).
+-    """
+     if "units" in data.attrs:
+         if isinstance(units, str):
+             if data.units != units:
+@@ -156,230 +59,113 @@ def check_units(data, units):
+         logger.warning("No units attribute found in data.")
+ 
+ 
+-def only_valid(data):
+-    """
+-    Select only valid (non-NaN) values from the data.
+-
+-    Parameters
+-    ----------
+-    data : xarray.DataArray
+-        Data to be filtered.
+-
+-    Returns
+-    -------
+-    xarray.DataArray
+-        Data with NaN values removed.
+-    """
+-    return data.sel(time=data.notnull())
+-
+-
+ def identity(x):
+-    """
+-    Identity link function.
+-
+-    Parameters
+-    ----------
+-    x : array_like
+-        The input data.
+-
+-    Returns
+-    -------
+-    array_like
+-        The input data.
+-    """
+     return x
+ 
+ 
+ def invlogit(x):
+-    """
+-    Inverse logit link function.
+-
+-    Parameters
+-    ----------
+-    x : array_like
+-        The input data.
+-
+-    Returns
+-    -------
+-    array_like
+-        The inverse logit of the input data.
+-    """
+     return 1 / (1 + np.exp(-x))
+ 
+ 
+-class Variable:
+-    """
+-    Climate variable base class.
+-
+-    Sub-classes need to implement `create_model` and `rescale` methods and might
+-    overwrite the default `quantile_mapping` function. A custom validation function
+-    should be called in `__init__`
+-
+-    Attributes
+-    ----------
+-    y_scaled : xarray.DataArray
+-        Rescaled input data.
+-    datamin : float, optional
+-        (Optional) minimum value of original data, used for rescaling.
+-    scale : float, optional
+-        (Optional) range between minimum and maximum value, used for rescaling.
+-    """
++def align_observation_and_predictor(y_scaled, predictor, dropna=True):
++    observation = y_scaled
++    if dropna:
++        observation = observation.sel(time=observation.notnull())
+ 
+-    def __init__(self, data):
+-        """
+-        Initialise a climate variable.
++    predictor_time = predictor.time.values
++    observation_time = observation.time.values
++    common_time = predictor_time[np.isin(predictor_time, observation_time)]
+ 
+-        Parameters
+-        ----------
+-        data: xarray.DataArray
+-            Observation data
+-        """
+-        raise NotImplementedError
++    observation_aligned = observation.sel(time=common_time)
++    predictor_aligned = predictor.sel(time=common_time)
++    return observation_aligned, predictor_aligned
+ 
+-    def validate(self, data):
+-        """
+-        Validate the input data, e.g. bounds and units.
+ 
+-        Parameters
+-        ----------
+-        data: xarray.DataArray
+-            Observation data
+-        """
+-        raise NotImplementedError
++def cap_extreme_quantile_mapped_values(mapped, y_reference, variable_name):
++    mapped = np.asarray(mapped, dtype=np.float64)
++    y_ref = np.asarray(y_reference, dtype=np.float64)
++    finite_ref = np.isfinite(y_ref)
++    if not finite_ref.any():
++        return mapped
+ 
+-    def create_model(self, statistical_model, predictor, **kwargs):
+-        """
+-        Create a model.
+-
+-        Parameters
+-        ----------
+-        statistical_model : class
+-            The statistical model class to be used for creating the model - should be
+-            a subclass of `attrici.estimation.model.AttriciGLM`.
+-        predictor : xarray.DataArray
+-            The predictor data used for the model.
+-        **kwargs
+-            Additional keyword arguments for the model.
+-
+-        Returns
+-        -------
+-        attrici.estimation.model.Model
+-            An instance of the created model.
+-        """
+-        raise NotImplementedError
++    y_max = float(np.nanmax(y_ref[finite_ref]))
++    y_p99 = float(np.nanpercentile(y_ref[finite_ref], 99))
++    upper_cap = max(y_max * 2.0, y_p99 * 2.5)
+ 
+-    def rescale(self, scaled_data):
+-        """
+-        Rescale data.
++    extreme = mapped > upper_cap
++    if extreme.any():
++        logger.warning(
++            "{} quantile mapping produced {} extreme values above {:.4f} (scaled); falling back to original values for those points",
++            variable_name,
++            int(extreme.sum().item() if hasattr(extreme.sum(), "item") else extreme.sum()),
++            upper_cap,
++        )
++        mapped[extreme] = np.nan
+ 
+-        Parameters
+-        ----------
+-        scaled_data : xarray.DataArray
+-            The data to be rescaled.
++    return mapped
+ 
+-        Returns
+-        -------
+-        xarray.DataArray
+-            The rescaled data.
+-        """
+-        raise NotImplementedError
+ 
++class Variable:
+     def quantile_mapping(self, distribution_ref, distribution_cfact):
+-        """
+-        Map data to respective quantile in the reference distribution.
+-
+-        Parameters
+-        ----------
+-        distribution_ref : Distribution
+-            The reference distribution.
+-        distribution_cfact : Distribution
+-            The counterfactual distribution.
+-
+-        Returns
+-        -------
+-        xarray.DataArray
+-            Data mapped to the respective quantile in the reference distribution.
+-        """
+         return distribution_cfact.invcdf(distribution_ref.cdf(self.y_scaled))
+ 
++    def y_scaled_from_scaling(self, data, scaling):
++        if "datamin" in scaling and "scale" in scaling:
++            return (data - scaling["datamin"]) / scaling["scale"]
++        if "scale" in scaling:
++            return data / scaling["scale"]
++        logger.warning(
++            "Trace scaling has no supported keys (need 'scale' or 'datamin'+'scale'); using default y_scaled"
++        )
++        return self.y_scaled
++
+ 
+ class Tas(Variable):
+-    """
+-    Daily mean near-surface air temperature (tas), modelled by a Normal distribution
+-    per time step.
++    """Influence of GMT is modelled through a shift of
++    mu parameter in the Normal distribution.
+     """
+ 
+-    # docstr-coverage:inherited
+     def __init__(self, data):
+         self.validate(data)
+         self.y_scaled, self.scaling = scale_to_unity(data)
+ 
+-    # docstr-coverage:inherited
+     def validate(self, data):
+         check_bounds(data, lower=0.0)
+         check_units(data, "K")
+ 
+-    # docstr-coverage:inherited
+-    def create_model(self, statistical_model_class, predictor, **kwargs):
+-        observation = only_valid(self.y_scaled.sel(time=predictor.time))
++    def create_model(self, statistical_model_class, predictor, modes):
++        observation, predictor_aligned = align_observation_and_predictor(
++            self.y_scaled, predictor
++        )
+         return statistical_model_class(
+             distribution=distributions.Normal,
+             parameters={
+-                "mu": AttriciGLM.Parameter(link=identity, dependent=True),
+-                "sigma": AttriciGLM.Parameter(link=np.exp, dependent=False),
++                "mu": AttriciGLM.PredictorDependentParam(link=identity, modes=modes),
++                "sigma": AttriciGLM.PredictorIndependentParam(link=np.exp, modes=modes),
+             },
+             observed=observation,
+-            predictor=predictor.sel(time=observation.time),
+-            **kwargs,
++            predictor=predictor_aligned,
+         )
+ 
+-    # docstr-coverage:inherited
+     def rescale(self, scaled_data):
+         return rescale_from_unity(scaled_data, self.scaling)
+ 
+ 
+ class Pr(Variable):
+-    """
+-    Precipitation (pr), modelled by a Bernoulli-Gamma distribution per time step.
++    THRESHOLD = 0.0000011574  # in kg m-2 s-1; "dry day" == 0.1mm/day / (86400s/day)
+ 
+-    - For wet or dry day: Bernoulli with dry-day probability `p`
+-    - For intensity of precipitation on wet days: Gamma with mean value `mu`
+-      and shape parameter `nu`.
+-    """
+-
+-    THRESHOLD = 0.0000011574
+-    """Dry day threshold in kg m-2 s-1; "dry day" == 0.1mm/day / (86400s/day)"""
+-
+-    # docstr-coverage:inherited
+     def __init__(self, data):
+         self.validate(data)
+         self.y_scaled, self.scaling = self.scale(data)
+ 
+-    # docstr-coverage:inherited
+     def validate(self, data):
+         check_bounds(data, lower=0.0)
+         check_units(data, "kg m-2 s-1")
+ 
+     def scale(self, data):
+-        """
+-        Precipitation specific scaling function.
+-
+-        Parameters
+-        ----------
+-        data : xarray.DataArray
+-            Original data
+-
+-        Returns
+-        -------
+-        xarray.DataArray
+-            The scaled data.
+-        dict
+-            The scaling information - contains the key "scale".
+-        """
+         scaled_data = data - self.THRESHOLD
+         logger.info(
+-            "Mask {} values below or at dry day threshold.",
+-            (scaled_data <= 0).sum().item(),
++            "Mask {} values below lower bound.", (scaled_data <= 0).sum().item()
+         )
+         scaled_data[scaled_data <= 0] = np.nan
+         if not scaled_data.notnull().any().item():
+@@ -402,23 +188,30 @@ class Pr(Variable):
+         )
+         return scaled_data, {"scale": scale.item()}
+ 
+-    # docstr-coverage:inherited
+-    def create_model(self, statistical_model_class, predictor, **kwargs):
+-        observation = self.y_scaled.sel(time=predictor.time)
++    def create_model(self, statistical_model_class, predictor, modes):
++        observation, predictor_aligned = align_observation_and_predictor(
++            self.y_scaled, predictor, dropna=False
++        )
+ 
+         return statistical_model_class(
+             distribution=distributions.BernoulliGamma,
+             parameters={
+-                "p": AttriciGLM.Parameter(link=invlogit, dependent=True),
+-                "mu": AttriciGLM.Parameter(link=np.exp, dependent=True),
+-                "nu": AttriciGLM.Parameter(link=np.exp, dependent=False),
++                "p": AttriciGLM.PredictorDependentParam(link=invlogit, modes=modes),
++                "mu": AttriciGLM.PredictorDependentParam(link=np.exp, modes=modes),
++                "nu": AttriciGLM.PredictorIndependentParam(link=np.exp, modes=modes),
+             },
+             observed=observation,
+-            predictor=predictor,
+-            **kwargs,
++            predictor=predictor_aligned,
+         )
+ 
+-    # docstr-coverage:inherited
++    def y_scaled_from_scaling(self, data, scaling):
++        if "scale" not in scaling:
++            return super().y_scaled_from_scaling(data, scaling)
++
++        y_scaled = data - self.THRESHOLD
++        y_scaled[y_scaled <= 0] = np.nan
++        return y_scaled / scaling["scale"]
++
+     def quantile_mapping(self, distribution_ref, distribution_cfact):
+         # make it a numpy array, so we can combine smoothly with d data frame.
+         y = self.y_scaled.values.copy()
+@@ -477,109 +270,94 @@ class Pr(Variable):
+             ).item(),
+         )
+ 
++        cfact = cap_extreme_quantile_mapped_values(cfact, self.y_scaled.values, "Pr")
++
+         return cfact
+ 
+-    # docstr-coverage:inherited
+     def rescale(self, scaled_data):
++        # TODO implement refilling of values that have been masked before
+         data = scaled_data * self.scaling["scale"] + self.THRESHOLD
+         data[scaled_data <= 0] = 0
+         return data
+ 
+ 
+ class Rlds(Variable):
+-    """
+-    Surface downwelling longwave radiation (rlds), modelled by a Normal distribution
+-    per time step.
++    """Influence of GMT on longwave downwelling shortwave radiation
++    is modelled through a shift of mu parameter in the Normal distribution.
+     """
+ 
+-    # docstr-coverage:inherited
+     def __init__(self, data):
+         self.validate(data)
+         self.y_scaled, self.scaling = scale_to_unity(data)
+ 
+-    # docstr-coverage:inherited
+     def validate(self, data):
+         check_bounds(data, lower=0.0)
+         check_units(data, "W m-2")
+ 
+-    # docstr-coverage:inherited
+-    def create_model(self, statistical_model_class, predictor, **kwargs):
+-        observation = only_valid(self.y_scaled.sel(time=predictor.time))
++    def create_model(self, statistical_model_class, predictor, modes):
++        observation, predictor_aligned = align_observation_and_predictor(
++            self.y_scaled, predictor
++        )
+         return statistical_model_class(
+             distribution=distributions.Normal,
+             parameters={
+-                "mu": AttriciGLM.Parameter(link=identity, dependent=True),
+-                "sigma": AttriciGLM.Parameter(link=np.exp, dependent=False),
++                "mu": AttriciGLM.PredictorDependentParam(link=identity, modes=modes),
++                "sigma": AttriciGLM.PredictorIndependentParam(link=np.exp, modes=modes),
+             },
+             observed=observation,
+-            predictor=predictor.sel(time=observation.time),
+-            **kwargs,
++            predictor=predictor_aligned,
+         )
+ 
+-    # docstr-coverage:inherited
+     def rescale(self, scaled_data):
+         return rescale_from_unity(scaled_data, self.scaling)
+ 
+ 
+ class Ps(Variable):
+-    """
+-    Surface air pressure (ps), modelled by a Normal distribution per time step.
++    """Influence of GMT on sea level pressure (ps) is modelled through a shift of
++    mu parameter in the Normal distribution.
+     """
+ 
+-    # docstr-coverage:inherited
+     def __init__(self, data):
+         self.validate(data)
+         self.y_scaled, self.scaling = scale_to_unity(data)
+ 
+-    # docstr-coverage:inherited
+     def validate(self, data):
+         check_bounds(data, lower=0.0)
+         check_units(data, "Pa")
+ 
+-    # docstr-coverage:inherited
+-    def create_model(self, statistical_model_class, predictor, **kwargs):
+-        observation = only_valid(self.y_scaled.sel(time=predictor.time))
++    def create_model(self, statistical_model_class, predictor, modes):
++        observation, predictor_aligned = align_observation_and_predictor(
++            self.y_scaled, predictor
++        )
+         return statistical_model_class(
+             distribution=distributions.Normal,
+             parameters={
+-                "mu": AttriciGLM.Parameter(link=identity, dependent=True),
+-                "sigma": AttriciGLM.Parameter(link=np.exp, dependent=False),
++                "mu": AttriciGLM.PredictorDependentParam(link=identity, modes=modes),
++                "sigma": AttriciGLM.PredictorIndependentParam(link=np.exp, modes=modes),
+             },
+             observed=observation,
+-            predictor=predictor.sel(time=observation.time),
+-            **kwargs,
++            predictor=predictor_aligned,
+         )
+ 
+-    # docstr-coverage:inherited
+     def rescale(self, scaled_data):
+         return rescale_from_unity(scaled_data, self.scaling)
+ 
+ 
+ class Hurs(Variable):
+-    """
+-    Near-surface relative humidity (hurs), modelled by a Beta distribution per time
+-    step as proposed in https://doi.org/10.1080/0266476042000214501.
++    """Influence of GMT on relative humidity (hurs) is modelled with Beta
++    regression as proposed in
++    https://www.tandfonline.com/doi/abs/10.1080/0266476042000214501
+     """
+ 
+-    # docstr-coverage:inherited
+     def __init__(self, data):
+         self.validate(data)
+         self.y_scaled, self.scaling = self.scale(data)
+ 
+-    # docstr-coverage:inherited
+     def validate(self, data):
+         check_bounds(data, lower=0.0, upper=100.0)
+         check_units(data, "%")
+ 
+     def scale(self, data):
+-        """
+-        Hurs-specific scaling funtion.
+-
+-        Parameters
+-        ----------
+-        data: xarray.DataArray
+-            Input data to be scaled.
+-        """
+         mask_thresholded(data, lower_threshold=0.01, upper_threshold=99.99)
+         scale = 100.0
+         scaled_data = data / scale
+@@ -590,135 +368,150 @@ class Hurs(Variable):
+         )
+         return scaled_data, {"scale": scale}
+ 
+-    # docstr-coverage:inherited
+-    def create_model(self, statistical_model_class, predictor, **kwargs):
+-        observation = only_valid(self.y_scaled.sel(time=predictor.time))
++    def create_model(self, statistical_model_class, predictor, modes):
++        observation, predictor_aligned = align_observation_and_predictor(
++            self.y_scaled, predictor
++        )
+         return statistical_model_class(
+             distribution=distributions.Beta,
+             parameters={
+-                "mu": AttriciGLM.Parameter(link=invlogit, dependent=True),
+-                "phi": AttriciGLM.Parameter(link=np.exp, dependent=False),
++                "mu": AttriciGLM.PredictorDependentParam(link=invlogit, modes=modes),
++                "phi": AttriciGLM.PredictorIndependentParam(link=np.exp, modes=modes),
+             },
+             observed=observation,
+-            predictor=predictor.sel(time=observation.time),
+-            **kwargs,
++            predictor=predictor_aligned,
+         )
+ 
+-    # docstr-coverage:inherited
+     def rescale(self, scaled_data):
+         return refill_and_rescale(scaled_data, self.scaling)
+ 
+ 
+ class Tasskew(Variable):
+-    """
+-    Daily near-surface temperatureskewness (tasskew), modelled by a Normal
+-    distribution per time step.
++    """Influence of GMT is modelled through a shift of
++    mu and sigma parameters in a Beta distribution.
+     """
+ 
+-    # docstr-coverage:inherited
+     def __init__(self, data):
+         self.validate(data)
+         self.y_scaled = data.copy()
+         self.scaling = {}
+         mask_thresholded(self.y_scaled, lower_threshold=0.0001, upper_threshold=0.9999)
+ 
+-    # docstr-coverage:inherited
+     def validate(self, data):
+         check_bounds(data, lower=0.0, upper=1.0)
+         check_units(data, {"1", "K"})
+ 
+-    # docstr-coverage:inherited
+-    def create_model(self, statistical_model_class, predictor, **kwargs):
+-        observation = only_valid(self.y_scaled.sel(time=predictor.time))
++    def create_model(self, statistical_model_class, predictor, modes):
++        observation, predictor_aligned = align_observation_and_predictor(
++            self.y_scaled, predictor
++        )
+         return statistical_model_class(
+             distribution=distributions.Normal,
+             parameters={
+-                "mu": AttriciGLM.Parameter(link=identity, dependent=True),
+-                "sigma": AttriciGLM.Parameter(link=np.exp, dependent=False),
++                "mu": AttriciGLM.PredictorDependentParam(link=identity, modes=modes),
++                "sigma": AttriciGLM.PredictorIndependentParam(link=np.exp, modes=modes),
+             },
+             observed=observation,
+-            predictor=predictor.sel(time=observation.time),
+-            **kwargs,
++            predictor=predictor_aligned,
+         )
+ 
+-    # docstr-coverage:inherited
+     def quantile_mapping(self, distribution_ref, distribution_cfact):
+         """
+-        nan values are not quantile-mapped. 100% humidity happens mainly at the
+-        poles.
++        nan values are not quantile-mapped. 100% humidity happens mainly at the poles.
+         """
+         res = distribution_cfact.invcdf(distribution_ref.cdf(self.y_scaled))
+         res[res >= 1] = np.nan
+         res[res <= 0] = np.nan
+         return res
+ 
+-    # docstr-coverage:inherited
+     def rescale(self, scaled_data):
+         return refill_and_rescale(scaled_data, {"scale": 1.0})
+ 
+ 
+ class Rsds(Variable):
+-    """
+-    Surface downwelling shortwave radiation (rsds), modelled by a Normal distribution
+-    per time.
++    """Influence of GMT is modelled through a shift of
++    mu and sigma parameters in a Normal distribution.
+     """
+ 
+-    # docstr-coverage:inherited
+     def __init__(self, data):
+         self.validate(data)
+         self.y_scaled, self.scaling = scale_to_unity(data)
+ 
+-    # docstr-coverage:inherited
+     def validate(self, data):
+         check_bounds(data, lower=0.0)
+         check_units(data, "W m-2")
+ 
+-    # docstr-coverage:inherited
+-    def create_model(self, statistical_model_class, predictor, **kwargs):
+-        observation = only_valid(self.y_scaled.sel(time=predictor.time))
++    def create_model(self, statistical_model_class, predictor, modes):
++        observation, predictor_aligned = align_observation_and_predictor(
++            self.y_scaled, predictor
++        )
+         return statistical_model_class(
+             distribution=distributions.Normal,
+             parameters={
+-                "mu": AttriciGLM.Parameter(link=identity, dependent=True),
+-                "sigma": AttriciGLM.Parameter(link=np.exp, dependent=False),
++                "mu": AttriciGLM.PredictorDependentParam(link=identity, modes=modes),
++                "sigma": AttriciGLM.PredictorIndependentParam(link=np.exp, modes=modes),
+             },
+             observed=observation,
+-            predictor=predictor.sel(time=observation.time),
+-            **kwargs,
++            predictor=predictor_aligned,
+         )
+ 
+-    # docstr-coverage:inherited
+     def quantile_mapping(self, distribution_ref, distribution_cfact):
+         """
+-        nan values are not quantile-mapped. 0 rsds happens mainly in the polar
+-        night.
++        nan values are not quantile-mapped. 0 rsds happens mainly in the polar night.
+         """
+         res = distribution_cfact.invcdf(distribution_ref.cdf(self.y_scaled))
+         res[res <= 0] = np.nan
+         return res
+ 
+-    # docstr-coverage:inherited
+     def rescale(self, scaled_data):
+         return rescale_from_unity(scaled_data, self.scaling)
+ 
+ 
+-class Tasrange(Variable):
++class RsdsWeibull(Variable):
++    """Influence of GMT is modelled through a shift of
++    the scale parameter beta in the Weibull distribution. The shape
++    parameter alpha is assumed free of a trend.
+     """
+-    Daily near-surface temperature range (tasrange), modelled by a Gamma distribution
+-    per time step.
++
++    def __init__(self, data):
++        self.validate(data)
++        self.y_scaled, self.scaling = scale_to_unity(data)
++
++    def validate(self, data):
++        check_bounds(data, lower=0.0)
++        check_units(data, "W m-2")
++
++    def create_model(self, statistical_model_class, predictor, modes):
++        observation, predictor_aligned = align_observation_and_predictor(
++            self.y_scaled, predictor
++        )
++        return statistical_model_class(
++            distribution=distributions.Weibull,
++            parameters={
++                "alpha": AttriciGLM.PredictorDependentParam(link=np.exp, modes=modes),
++                "beta": AttriciGLM.PredictorIndependentParam(link=np.exp, modes=modes),
++            },
++            observed=observation,
++            predictor=predictor_aligned,
++        )
++
++    def rescale(self, scaled_data):
++        return rescale_from_unity(scaled_data, self.scaling)
++
++
++class Tasrange(Variable):
++    """Influence of GMT is modelled through a shift of
++    mu and sigma parameters in a Beta distribution. TODO fix comment not Beta
+     """
+ 
+-    # docstr-coverage:inherited
+     def __init__(self, data):
+         self.validate(data)
+         self.y_scaled, self.scaling = self.scale(data)
+ 
+-    # docstr-coverage:inherited
+     def validate(self, data):
+         check_bounds(data, lower=0.0)
+         check_units(data, "K")
+ 
+-    # docstr-coverage:inherited
+     def scale(self, data):
+         mask_thresholded(data, lower_threshold=0.01)
+         datamin = data.min()
+@@ -731,42 +524,55 @@ class Tasrange(Variable):
+         )
+         return scaled_data, {"scale": scale}
+ 
+-    # docstr-coverage:inherited
+-    def create_model(self, statistical_model_class, predictor, **kwargs):
+-        observation = only_valid(self.y_scaled.sel(time=predictor.time))
++    def create_model(self, statistical_model_class, predictor, modes):
++        observation, predictor_aligned = align_observation_and_predictor(
++            self.y_scaled, predictor
++        )
+         return statistical_model_class(
+             distribution=distributions.Gamma,
+             parameters={
+-                "mu": AttriciGLM.Parameter(link=np.exp, dependent=True),
+-                "nu": AttriciGLM.Parameter(link=np.exp, dependent=False),
++                "mu": AttriciGLM.PredictorDependentParam(link=np.exp, modes=modes),
++                "nu": AttriciGLM.PredictorIndependentParam(link=np.exp, modes=modes),
+             },
+             observed=observation,
+-            predictor=predictor.sel(time=observation.time),
+-            **kwargs,
++            predictor=predictor_aligned,
++        )
++
++    def y_scaled_from_scaling(self, data, scaling):
++        if "scale" not in scaling:
++            return super().y_scaled_from_scaling(data, scaling)
++
++        y_scaled = data.copy()
++        mask_thresholded(y_scaled, lower_threshold=0.01)
++        return y_scaled / scaling["scale"]
++
++    def quantile_mapping(self, distribution_ref, distribution_cfact):
++        mapped = super().quantile_mapping(distribution_ref, distribution_cfact)
++        # Guard against occasional heavy-tail explosions from Gamma quantile mapping.
++        # Values above this adaptive cap are treated as invalid and later replaced
++        # with original observations in detrend.fit_and_detrend_cell.
++        return cap_extreme_quantile_mapped_values(
++            mapped, self.y_scaled.values, "Tasrange"
+         )
+ 
+-    # docstr-coverage:inherited
+     def rescale(self, scaled_data):
+         return refill_and_rescale(scaled_data, self.scaling)
+ 
+ 
+ class Wind(Variable):
+-    """
+-    Near-surface wind speed (sfcwind), modelled by a Weibull distribution per time
+-    step.
++    """Influence of GMT is modelled through a shift of
++    the scale parameter beta in the Weibull distribution. The shape
++    parameter alpha is assumed free of a trend.
+     """
+ 
+-    # docstr-coverage:inherited
+     def __init__(self, data):
+         self.validate(data)
+         self.y_scaled, self.scaling = self.scale(data)
+ 
+-    # docstr-coverage:inherited
+     def validate(self, data):
+         check_bounds(data, lower=0.0)
+         check_units(data, "m s-1")
+ 
+-    # docstr-coverage:inherited
+     def scale(self, data):
+         mask_thresholded(data, lower_threshold=0.01)
+         datamin = data.min()
+@@ -779,44 +585,39 @@ class Wind(Variable):
+         )
+         return scaled_data, {"scale": scale}
+ 
+-    # docstr-coverage:inherited
+-    def create_model(self, statistical_model_class, predictor, **kwargs):
+-        observation = only_valid(self.y_scaled.sel(time=predictor.time))
++    def create_model(self, statistical_model_class, predictor, modes):
++        observation, predictor_aligned = align_observation_and_predictor(
++            self.y_scaled, predictor
++        )
+         return statistical_model_class(
+             distribution=distributions.Weibull,
+             parameters={
+-                "alpha": AttriciGLM.Parameter(link=np.exp, dependent=False),
+-                "beta": AttriciGLM.Parameter(link=np.exp, dependent=True),
++                "alpha": AttriciGLM.PredictorIndependentParam(link=np.exp, modes=modes),
++                "beta": AttriciGLM.PredictorDependentParam(link=np.exp, modes=modes),
+             },
+             observed=observation,
+-            predictor=predictor.sel(time=observation.time),
+-            **kwargs,
++            predictor=predictor_aligned,
++        )
++
++    def y_scaled_from_scaling(self, data, scaling):
++        if "scale" not in scaling:
++            return super().y_scaled_from_scaling(data, scaling)
++
++        y_scaled = data.copy()
++        mask_thresholded(y_scaled, lower_threshold=0.01)
++        return y_scaled / scaling["scale"]
++
++    def quantile_mapping(self, distribution_ref, distribution_cfact):
++        mapped = super().quantile_mapping(distribution_ref, distribution_cfact)
++        return cap_extreme_quantile_mapped_values(
++            mapped, self.y_scaled.values, "Wind"
+         )
+ 
+-    # docstr-coverage:inherited
+     def rescale(self, scaled_data):
+         return refill_and_rescale(scaled_data, self.scaling)
+ 
+ 
+ def create_variable(variable, data):
+-    """
+-    Returns a Variable instance based on a string abbreviation.
+-
+-    The variable abbreviation is mapped to the respective Variable class.
+-    See also `attrici.detrend`.
+-
+-    Parameters
+-    ----------
+-    variable : str
+-        Short variable name like `tas`.
+-    data : xarray.DataArray
+-        Observation data for the variable
+-
+-    Returns
+-    -------
+-    Variable
+-        An instance of the corresponding Variable class.
+-    """
+     MODEL_FOR_VAR = {
+         "hurs": Hurs,
+         "pr": Pr,

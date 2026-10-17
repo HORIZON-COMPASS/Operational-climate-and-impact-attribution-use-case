@@ -1,0 +1,24 @@
+name: compass-daily-data
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - cdo
+  - nco
+  - eccodes
+  - cdsapi
+  - cfgrib
+  - numpy=1.26
+  - pandas=2.2
+  - scipy
+  - xarray=2024.7
+  - netcdf4
+  - h5netcdf
+  - dask
+  - geopandas
+  - rioxarray
+  - rasterio
+  - matplotlib
+
+# ISIMIP3BASD is installed separately because the scripts expect its source tree
+# under daily-data/isimip3basd-master. See daily-data/README.md.

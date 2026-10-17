@@ -1,0 +1,31 @@
+name: compass-attrici
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - scipy
+  - pandas
+  - xarray
+  - dask
+  - netcdf4
+  - h5netcdf
+  - pytables
+  - pymc=5.20
+  - arviz
+  - loguru
+  - tqdm
+  - tomlkit
+  - joblib
+  - matplotlib
+  - geopandas
+  - shapely
+  - pyproj
+  - pyogrio
+  - pip:
+      - func_timeout
+      - -e ./vendor/attrici
+
+# Create this environment from the repository root so that the editable path
+# ./vendor/attrici is resolved consistently by Conda's pip phase.

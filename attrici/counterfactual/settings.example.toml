@@ -1,0 +1,40 @@
+[paths]
+# Relative paths are resolved from this configuration file.
+step8_dir = "../../daily-data/step_8"
+trace_dir = "../cfact"
+gmt_file = "../cfact/ssa_gmt_daily_1950_2024.nc"
+# Use an executable name available on PATH or a relative/absolute executable path.
+attrici_bin = "attrici"
+work_dir = "work"
+shapefile = "../../daily-data/shp/voivodeships.shp"
+
+[files]
+step8_pattern = "ERA5_{var}_ERA5_filled_{year}_basd.nc"
+trace_pattern = "{var}_ERA5_1950_2024_trace.nc"
+
+[variables]
+core = ["tas", "tasrange", "hurs", "rsds", "sfcWind", "pr"]
+map = ["tn", "tx", "ws", "pd", "pr", "rg"]
+
+[workflow]
+# Supported COMPASS runtime profile. Do not change modes or extrapolation without
+# a separately validated set of fitted traces and a matching GMT scaling basis.
+modes = 4
+full_extrapolation = true
+auto_align_input = false
+# Add "replaced" when a run should retain per-cell replacement diagnostics.
+report_variables = ["y", "cfact", "logp"]
+daily_lag_days = 9
+daily_context_days = 7
+task_count = 8
+days_back_start = 15
+days_window = 7
+
+[grid]
+# Grid used by the COMPASS Poland demonstrator.
+xfirst = 12.9583333333333
+xinc = 0.0166666666666667
+yfirst = 55.0416666666667
+yinc = -0.0166666666666667
+xsize = 786
+ysize = 426

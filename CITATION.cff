@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the COMPASS PROJECT and this software release."
+title: "COMPASS operational climate and impact attribution use case"
+type: software
+version: 2.1.0
+date-released: 2026-09-09
+authors:
+  - name: "COMPASS project funding from the European Union’s HORIZON Research and Innovation Actions Programme under Grant Agreement No. 101135481"
+keywords:
+  - climate attribution
+  - impact attribution
+  - counterfactual climate
+  - crop impacts
+license: GPL-3.0-only
